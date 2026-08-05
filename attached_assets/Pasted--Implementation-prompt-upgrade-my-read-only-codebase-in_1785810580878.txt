@@ -1,0 +1,72 @@
+# Implementation prompt: upgrade my read-only codebase-intelligence agent
+
+## Context
+
+Attached is `auth_flow.py` — a working Python script that:
+- Authenticates against a Codex-style chat backend via OAuth (device/browser flow already working — **do not touch this part**).
+- Runs a ReAct loop: the model plans in `<thought>`, requests tools in a `<tools>` JSON array, gets results back in a synthetic `<tool_results>` user message, and must produce a `<verify>` block before its final answer.
+- Executes six read-only tools (`list_projects`, `get_architecture`, `search_code`, `get_code_snippet`, `search_graph`, `query_graph`) by shelling out to a local compiled binary, `codebase-memory-mcp.exe`, which already does the AST/graph-level heavy lifting (it returns `qualified_name`s and supports graph queries).
+- Has a session cache for two tools, hand-rolled tool-arg validation, a rate limiter, and single-retry verify enforcement.
+
+**Scope constraint: read-only only.** Do not add `apply_patch`, `run_tests`, `execute_command`, or any tool that writes to disk or runs code. That's a later phase — not this one. Do not modify the OAuth/login flow (`perform_login`, `refresh_access_token`, `fetch_available_model`) — it works and is out of scope.
+
+**Do not duplicate the MCP binary's job.** The six existing tools already return qualified names and support graph queries — treat `codebase-memory-mcp.exe` as a capable black box. Do not add local tree-sitter parsing, embeddings, or a vector store unless a specific gap is identified in what the binary already returns.
+
+## Restructure first
+
+Split the single file into modules (keep behavior identical, this is a pure refactor):
+
+```
+codebase_agent/
+├── main.py            # entrypoint: token load/refresh, kicks off the chat loop
+├── auth.py             # perform_login, refresh_access_token, fetch_available_model — unchanged
+├── mcp_tools.py        # execute_mcp_tool, SessionCache, TOOL_SCHEMAS, validate_tool_call
+├── context.py          # new: token counting + compaction (see Phase 1)
+├── agent.py            # build_system_instructions, chat_with_codex, the ReAct loop
+└── config.py           # CLIENT_ID, PORT, MCP_EXE_PATH, MAX_RPM, etc.
+```
+
+Confirm the app still runs identically after the split before moving to Phase 1.
+
+## Dependencies to add
+
+- `pip install tiktoken jsonschema`
+
+No other new dependencies for this phase.
+
+## Phase 1 — Token-aware context compaction (`context.py`)
+
+- Use `tiktoken` to estimate token count of the running `messages` list before each call to `chat_with_codex`.
+- Set a token budget (leave headroom under the model's context window — expose as a config constant).
+- When the budget is exceeded:
+  - Keep the first user message of the current question and the most recent N turns verbatim.
+  - Summarize everything older into a single compact system-style message: bullet facts + which files/qualified_names were referenced + open questions. This can be a direct call to the same model with a dedicated summarization instruction, or a cheaper deterministic truncation if you'd rather not spend an extra call — implement the deterministic version first, add LLM summarization as a fallback only if truncation loses too much.
+  - Never summarize away the current, unanswered user question.
+- Keep the full untouched transcript in memory (or written to disk) separately from the compacted "working" context, so nothing is unrecoverably lost — the compaction only affects what's sent to the model.
+
+## Phase 2 — Evidence-checked `<verify>` enforcement (`agent.py`)
+
+Currently the loop only checks that a `<verify>` tag exists. Extend this to substance:
+
+- Give every executed tool call a short id (e.g. `t-<n>` per turn) and track a mapping from id → the tool name, args, and result text.
+- Require the `<verify>` block to reference those ids explicitly for each claim (update the system instructions with an example of this format).
+- After parsing `<verify>`, check programmatically that every referenced id actually exists in the tool-result map for this conversation. If a claim has no matching id, or references one that doesn't exist, don't accept the final answer — reuse the existing single-retry pattern (`verify_retry_used`) but with a message that names the specific unsupported claim.
+
+## Phase 3 — `jsonschema`-based tool validation (`mcp_tools.py`)
+
+- Replace `TOOL_REQUIRED_ARGS` / `validate_tool_call` with real JSON Schemas (one dict per tool: required fields, types, and enums where applicable — e.g. `label` in `search_graph` should be an enum of `Method|Class|File` if that's the real constraint).
+- Validate with `jsonschema.validate()`, catching `ValidationError` and turning it into the same kind of `"VALIDATION ERROR (tool NOT executed): ..."` string the loop already expects, so the rest of the pipeline doesn't need to change.
+
+## Phase 4 — Extend caching to all read-only tools
+
+- Widen `CACHEABLE_TOOLS` to include `search_code`, `get_code_snippet`, and `search_graph` (keyed by exact args, as already implemented in `SessionCache`) — these are read-only and idempotent for the life of a session, same justification you already used for `list_projects`/`get_architecture`.
+- Keep `query_graph` out of the cache by default unless you're confident repeated identical cypher queries are common enough to be worth it.
+
+## Phase 5 — Empty-result / stuck-loop handling
+
+- When a tool result is empty or clearly a "no matches" response, don't just feed it back silently. Have the loop detect this pattern and append explicit guidance to the synthetic tool-result message: suggest broadening the search pattern, trying `search_graph` instead of `search_code`, or checking the project name.
+- Track repeated identical `(tool, args)` calls across turns (not just within one batch, which is already deduped) — if the same call is made 3 times with no new information in between, insert a system message forcing the model to change its approach rather than repeat the query.
+
+## How to work
+
+Implement one phase at a time, in order. After each phase, show me the diff against the previous state and a one-line note on what changed and why, rather than rewriting the whole file each time. Ask before starting Phase 1 if anything above is ambiguous given the actual code.

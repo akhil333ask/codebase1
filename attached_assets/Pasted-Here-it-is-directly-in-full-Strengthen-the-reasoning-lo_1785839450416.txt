@@ -1,0 +1,58 @@
+Here it is directly, in full:
+
+```
+# Strengthen the reasoning loop in the codebase-intelligence agent
+
+## System context
+
+This is a read-only, ReAct-style codebase-intelligence CLI. The reasoning model (gpt-5.4-mini, via the existing Codex/Responses integration in `chat_with_codex` — fixed, don't touch) plans and acts in a loop: `<thought>` → `<tools>` (a JSON array of tool calls) → results come back as a synthetic `<tool_results>` message → repeat until a final answer with a `<verify>` block citing a tool-result id for every claim.
+
+**In scope — this is the "brain":**
+- `agent.py`: `build_system_instructions` (the system prompt), `check_verify_block` (Phase 2 evidence checking), `_looks_like_empty_result`/`_empty_result_guidance` (Phase 5a), the stuck-loop guard (Phase 5b), `start_interactive_chat` (the loop itself). Not `chat_with_codex`'s HTTP/streaming internals.
+- `mcp_tools.py`: `TOOL_SCHEMAS` (tool docs injected into the prompt), the native `grep_search`/`read_file_chunk` tools (Phase 6 — pure Python, no MCP binary, fully yours to extend), and what gets exposed/validated for the MCP-binary-backed tools. Not `execute_mcp_tool`'s subprocess plumbing, and not `MCP_EXE_PATH` — that binary is a black box.
+- `context.py`: the deterministic compaction/summarization logic.
+- `config.py`: only the tunables — `CONTEXT_TOKEN_BUDGET`, `CONTEXT_KEEP_RECENT_TURNS`, `GREP_MAX_RESULTS`, `GREP_MAX_FILE_BYTES`, `READ_FILE_CHUNK_MAX_LINES`, `MAX_RPM`. Not the OAuth block, not `PROJECT_ROOTS`/`WORKSPACE_ROOT` values.
+
+**Out of scope:** `auth.py`, `main.py`, the OAuth portion of `config.py`. Don't touch these.
+
+**Preserve unless you thread a change through both sides:** the `<thought>/<tools>/<verify>` tag contract (the loop's regexes parse these exactly), existing tool names/argument shapes, and the read-only guarantee — no tool should ever write to the target project.
+
+## Regression case
+
+I asked it to trace a DICOM pixel-data pipeline and find three things: (1) the method that hands a `BULKDATA_DESCRIPTOR` to dcm4che3, (2) the class/method that does the delayed fetch of raw pixel bytes for rendering, (3) the class/method that applies Modality/VOI LUT (window/level).
+
+It nailed (1) and (3) with correctly-cited `<verify>` claims. For (2) it ran exactly one `search_graph` call aimed at that finding — query `"raw pixel bytes rendering delayed fetch"`, label `Method` — didn't get a confident hit, and closed with "I could not yet verify... so I'm not going to guess it." Right instinct (no hallucination), wrong outcome: it still had 26 of 30 RPM left, and it already had concrete, unused leads (`getImageFragment`, `getSingleImage`, `ImageConversion.toBufferedImage`, all surfaced from `DicomMediaIO.read` in its own evidence) that it never followed up on with a targeted `grep_search` or `get_code_snippet`.
+
+Get this specific case passing, then write 1-2 more multi-hop questions of the same shape (trace-a-call-path, not just find-a-definition) to confirm the fix generalizes rather than just patching this one instance.
+
+## Root causes
+
+1. **`query_graph` (raw Cypher against the real graph) is the right primitive for "what calls/produces/implements X," and the model never reaches for it.** `build_system_instructions` never documents the graph's relationship types, never shows a worked `query_graph` example (the only related rule — #5 — is a *negative* one about not embedding raw code in a query), and rule #9 only ever points the model at `search_graph`, a fuzzy node-similarity search, for "how things work" questions. That's a category mismatch for a call-graph question.
+
+2. **`check_verify_block` checks grounding, not coverage.** It confirms every claim cites a real tool-result id — it has no notion of the original question's sub-goals, so a `<verify>` block that silently drops one of four required findings (even while the model's own prose admits it's unresolved) passes as a valid, finished answer. The Phase 5b stuck-loop guard forces a change of behavior on repeated calls; nothing forces a change of behavior on premature stopping.
+
+3. **The Phase 5a empty-result detector only catches literal emptiness.** A `search_graph` call that comes back with a few weak, unconvincing candidates — not zero results, just not enough to cite — never triggers the same "try something else" guidance a truly empty result would.
+
+## What to build
+
+**1. Make `query_graph` usable for relationship questions.**
+- First verify empirically what relationship types the graph actually exposes — don't hardcode a guess. Probe it directly (schema introspection if the backend supports it, or inspect a few real responses).
+- Inject a short schema block into `build_system_instructions`, same pattern as the existing `known_block` injection.
+- Add a rule: for "what calls/produces/implements/consumes X" questions, prefer `query_graph` with a relationship-traversal query over a fuzzy `search_graph` text query.
+- Add a worked example in the same style as the existing "Example Tool Invocation"/"Example Fallback" blocks — a `query_graph` call that starts from a known `qualified_name` and walks an edge to find a caller/callee.
+
+**2. Tie `<verify>` to the plan's stated sub-goals.**
+- When the "PLAN BEFORE YOU ACT" block fires, capture the sub-goals it lists (even a lightweight parsed `<goals>` block would do) and check the final `<verify>` against them.
+- When a required sub-goal is missing or explicitly marked unresolved, force one more continuation turn — reuse the `verify_retry_used` pattern or add a parallel slot — requiring either a genuinely new, more targeted tool call built from leads already in evidence, or an explicit account of what was tried and why it's actually unavailable. "I won't guess" shouldn't end the turn on its own while a stated sub-goal is still open and unexplored options remain.
+
+**3. Broaden "weak result" detection past literal emptiness.**
+- Extend the Phase 5a check (or add a parallel one) so a technically-non-empty but low-confidence `search_graph`/`query_graph` result — very few candidates, low overlap with the query terms — also gets the "try a different approach" guidance, not just true zero-result cases.
+
+**4. Lower priority, if time allows:**
+- A native `find_symbol_usages` tool (pure Python, same pattern as `grep_search`/`read_file_chunk`): given an exact identifier, return definition-like and call-site-like occurrences with `file:line`, as a guaranteed backstop if the graph's call-graph support turns out to be thin.
+- In `context.py`, consider carrying a small structured "tools tried + one-line outcome" record verbatim across compaction, separate from the free-text bullet summary — `summarize_deterministic` today keeps only truncated excerpts and extracted names, which is lossy for "have I already tried this" reasoning in long sessions.
+
+## Process
+
+Propose your plan — which functions change, roughly how — before rewriting anything; this is a working system. Keep the `# Phase N:` comment convention already used throughout. When done, re-run the pixel-pipeline question end-to-end and confirm all three findings verify, plus your new test questions.
+```

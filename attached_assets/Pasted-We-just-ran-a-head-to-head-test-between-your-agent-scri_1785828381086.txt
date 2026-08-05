@@ -1,0 +1,30 @@
+We just ran a head-to-head test between your agent script and VS Code's internal Copilot agent. I gave you both a highly complex codebase tracing task (tracing delayed pixel loading in the Weasis DICOM viewer). 
+
+Here is the conclusion of the test:
+1. **Your logic and control flow were superior.** When your tools failed to find the exact method, your strict `<verify>` loop forced you to be honest and admit you couldn't find the evidence. VS Code ignored my formatting constraints entirely.
+2. **However, VS Code found the exact correct answers, and you failed.** 
+
+**WHY YOU FAILED:**
+You relied entirely on `search_graph` and `search_code`. You tried passing massive "keyword salads" (e.g., `"query":"bulkdata descriptor pixel data window level"`) to the graph database, which returned zero results because graph databases expect specific node names, not full-text searches.
+
+**WHY VS CODE SUCCEEDED:**
+VS Code recognized that graph search failed, so it dynamically fell back to brute-force native tools. It used a `grep_search` tool with regex (`BulkDataDescriptor|IncludeBulkData|DicomInputStream`) to find the exact file. Then, it used a `read_file` tool to read specific line ranges (e.g., `lines 1080 to 1185`) to manually inspect the code like a human developer would.
+
+**YOUR MISSION:**
+I want you to upgrade your own script to include these "god-tier" text and file reading tools. You must update `mcp_tools.py` and `agent.py` to implement the following:
+
+**1. Update `mcp_tools.py` to add two new tools:**
+*   **`grep_search`**: A tool that does a pure regex/text search across the codebase. 
+    *   *Args:* `project` (string), `regex_pattern` (string), `file_pattern` (string, optional, e.g., "**/*.java").
+    *   *Implementation:* You can implement this as a new MCP tool call if the CLI supports it, or write a native Python fallback inside `execute_mcp_tool` that iterates through the local workspace files and uses Python's `re` module. (Assume the workspace path can be derived or passed in).
+*   **`read_file_chunk`**: A tool to read specific line ranges of a file. (We cannot read whole files because it will blow up our `CONTEXT_TOKEN_BUDGET`).
+    *   *Args:* `project` (string), `file_path` (string, relative to project), `start_line` (integer), `end_line` (integer).
+    *   *Implementation:* Read the file from disk and return just those lines with line numbers prepended.
+*   *Requirement:* Update `TOOL_SCHEMAS`, `TOOL_JSON_SCHEMAS`, and the validation logic to support these perfectly.
+
+**2. Update `agent.py` System Instructions:**
+*   Modify `build_system_instructions()` to teach the AI *how* to use these new tools. 
+*   Add a rule: "If `search_graph` or `search_code` return empty results for concepts or keywords, immediately fall back to `grep_search` with a regex pattern."
+*   Add a rule: "When you find a file of interest via grep, use `read_file_chunk` to read the surrounding 100-200 lines to understand the context before answering."
+
+Please output the fully updated code for **`mcp_tools.py`** and **`agent.py`**. Ensure you maintain all the Phase 1-5 protections (stuck loop detection, verify block checking, context compaction) that made your logic so strong in the first place.

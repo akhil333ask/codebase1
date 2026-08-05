@@ -1,0 +1,477 @@
+# ==========================================
+# agent.py — the ReAct loop: system instructions, the chat call, tool
+# dispatch, and (Phase 2) evidence-checked <verify> enforcement.
+#
+# The planner-merged-into-worker design, the rate limiter, and the basic
+# shape of the loop are UNCHANGED from the original script. What's new
+# in this pass:
+#   - Phase 1: `context.compact_if_needed` is applied to the working
+#     messages list right before every model call.
+#   - Phase 2: every executed tool call gets a short id (t-<n>), and the
+#     final `<verify>` block is checked programmatically against those
+#     ids instead of just checked for existence.
+#   - Phase 5: empty/no-match tool results get explicit guidance appended
+#     instead of being fed back silently, and a repeated identical
+#     (tool, args) call across turns triggers a forced-change system
+#     message instead of letting the model loop forever.
+# ==========================================
+import json
+import re
+import time
+from collections import deque
+
+import requests
+
+import context
+from config import MAX_RPM
+from mcp_tools import (
+    TOOL_SCHEMAS,
+    execute_mcp_tool,
+    known_context,
+    note_known_projects,
+    validate_tool_call,
+)
+
+
+# ==========================================
+# RATE LIMITER (RPM MANAGER) — unchanged
+# ==========================================
+class RateLimiter:
+    def __init__(self, max_rpm):
+        self.max_rpm = max_rpm
+        self.requests = deque()
+
+    def wait_if_needed(self):
+        now = time.time()
+        while self.requests and now - self.requests[0] > 60:
+            self.requests.popleft()
+
+        if len(self.requests) >= self.max_rpm:
+            wait_time = 60 - (now - self.requests[0])
+            if wait_time > 0:
+                print(f"\n[!] RPM limit ({self.max_rpm}) reached. Pausing for {wait_time:.1f} seconds to cool down...")
+                time.sleep(wait_time)
+            now = time.time()
+            while self.requests and now - self.requests[0] > 60:
+                self.requests.popleft()
+
+        self.requests.append(time.time())
+        print(f" [RPM: {len(self.requests)}/{self.max_rpm}] ", end="", flush=True)
+
+
+rate_limiter = RateLimiter(MAX_RPM)
+
+
+# ==========================================
+# THE AGENT (plans + acts in one call)
+# ==========================================
+def build_system_instructions(is_new_investigation):
+    known_block = ""
+    if known_context["projects"]:
+        known_block = (
+            "\nALREADY KNOWN THIS SESSION — do NOT call list_projects again, reuse this:\n"
+            f"{known_context['projects']}\n"
+        )
+
+    planning_block = ""
+    if is_new_investigation:
+        planning_block = """
+NEW QUESTION — PLAN BEFORE YOU ACT:
+Open your <thought> block with a short plan, not just a single next step:
+  - Restate the real underlying question, not just the literal words.
+  - List the 2-4 sub-goals you need evidence for.
+  - Say what you already know (see ALREADY KNOWN above) vs what you still need to look up.
+  - Batch every lookup that doesn't depend on another lookup's result into ONE <tools> array.
+Then take your first action from that plan.
+"""
+
+    return f"""You are an elite Senior Software Engineer diagnosing a codebase via read-only tools.
+{known_block}
+{TOOL_SCHEMAS}
+{planning_block}
+CRITICAL EXECUTION RULES:
+1. THINK FIRST: You MUST output a `<thought>...</thought>` block explaining your logic before taking action or giving a final answer.
+2. PARALLEL TOOLS: To run tools, output a `<tools>...</tools>` block containing a JSON ARRAY of tool calls. Combine tool calls when they don't depend on each other.
+3. DEPENDENCY AWARENESS: If the project isn't already given above under ALREADY KNOWN, your ONLY tool call must be `list_projects` — do not bundle guessed `search_code`/`search_graph` calls alongside it. Once you know the project, always use it exactly as given; never pass `"project": "*"` or leave it blank.
+4. QUALIFIED NAMES: `search_code`/`search_graph` results include a `qualified_name` field, e.g. `"qualified_name": "C-JViewer.weasis-dicom.weasis-dicom-viewer2d.src.main.java.org.weasis.dicom.viewer2d.View2d.computeCrosshair"`. To call `get_code_snippet`, copy that field's value EXACTLY, character for character. Never guess it, and never append anything to it — no ` = ...`, no method bodies, no extra code or expressions. If no `qualified_name` field is in front of you for what you need, search again instead of constructing one yourself.
+5. NO RAW CODE IN CYPHER: Never put raw multi-line Java code into a `query_graph` query.
+6. THE LOOP: When you run tools, the system will instantly reply with a `<tool_results>` block. Each individual result is tagged with a short id, e.g. `<result id="t-3" tool="search_code">`. Read it and continue your investigation automatically until you have the final answer. Do not ask the user for permission.
+7. VALIDATE BEFORE FINISHING: Only on the turn where you are NOT calling more tools, output a `<verify>` block. For EACH factual claim you're about to make, write one line ending with the id(s) of the tool result(s) that support it — copy the id exactly as given in `<result id="...">`, e.g.:
+<verify>
+- The crosshair is computed in `View2d.computeCrosshair` (t-3)
+- The DICOM parser lives in `DicomInputStream.readDataset` (t-1, t-5)
+</verify>
+   A claim with no id, or an id that wasn't actually given to you earlier in this conversation, will be rejected and you'll be asked to fix it. Drop or re-investigate anything you can't back with a real id. Don't include a `<verify>` block on turns where you're still calling tools.
+8. LANGUAGE: Always respond strictly in English.
+9. TOOL PREFERENCE: When looking for how things work, prefer `search_graph` to find underlying core engine/codec implementations.
+
+Example Tool Invocation:
+<thought>I need to search for the Main class.</thought>
+<tools>
+[
+    {{"_mcp_tool": "search_graph", "_mcp_args": {{"project": "C-JViewer", "query": "main", "label": "Class", "limit": 5}}}}
+]
+</tools>
+"""
+
+
+def chat_with_codex(access_token, model_id, messages, is_new_investigation=False):
+    rate_limiter.wait_if_needed()
+    url = "https://chatgpt.com/backend-api/codex/responses"
+
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json",
+        "Accept": "text/event-stream",
+        "OpenAI-Beta": "responses=experimental",
+        "originator": "custom_python_script"
+    }
+
+    system_instructions = build_system_instructions(is_new_investigation)
+
+    payload = {
+        "model": model_id,
+        "store": False,
+        "stream": True,
+        "instructions": system_instructions,
+        "input": messages,
+        "text": {"verbosity": "low"}
+    }
+
+    print("\n\U0001f916 AI: ", end="", flush=True)
+
+    response = requests.post(url, headers=headers, json=payload, stream=True)
+    full_response = ""
+
+    if response.status_code == 200:
+        for line in response.iter_lines():
+            if line:
+                decoded_line = line.decode('utf-8')
+                if decoded_line.startswith("data: ") and decoded_line != "data: [DONE]":
+                    try:
+                        chunk = json.loads(decoded_line[6:])
+                        if chunk.get("type") == "response.output_text.delta":
+                            text_chunk = chunk.get("delta", "")
+                            print(text_chunk, end="", flush=True)
+                            full_response += text_chunk
+                    except json.JSONDecodeError:
+                        pass
+        print()
+        return full_response
+    return None
+
+
+# ==========================================
+# Phase 2: evidence-checked <verify> enforcement
+# ==========================================
+_VERIFY_BLOCK_RE = re.compile(r'<verify>\s*(.*?)\s*</verify>', re.DOTALL)
+_ID_REF_RE = re.compile(r't-\d+')
+
+
+def _parse_verify_claims(verify_body):
+    """A claim is any non-empty line inside the <verify> block."""
+    return [line.strip() for line in verify_body.splitlines() if line.strip()]
+
+
+def check_verify_block(assistant_reply, tool_result_map):
+    """
+    Returns (ok, detail):
+      - ok=True, detail=None -> every claim line cites at least one tool-
+        result id, and every cited id exists in `tool_result_map` (i.e. was
+        actually returned to the model earlier in this conversation).
+      - ok=False, detail=<str> -> names the first offending claim (or the
+        reason no claims/no block exist at all) so the retry message can be
+        specific instead of a generic "add a <verify> block" nudge.
+    """
+    match = _VERIFY_BLOCK_RE.search(assistant_reply)
+    if not match:
+        return False, "No <verify> block was found in the final answer."
+
+    claims = _parse_verify_claims(match.group(1))
+    if not claims:
+        return False, "The <verify> block is present but contains no claims."
+
+    for claim in claims:
+        ids = _ID_REF_RE.findall(claim)
+        if not ids:
+            return False, f'Claim has no tool-result id attached: "{claim}"'
+        for tool_id in ids:
+            if tool_id not in tool_result_map:
+                return False, f'Claim cites "{tool_id}", which is not a tool result from this conversation: "{claim}"'
+
+    return True, None
+
+
+# ==========================================
+# Phase 5a: empty / "no matches" result detection
+# A tool call that technically succeeds but finds nothing is easy for the
+# model to skim past without changing strategy. Detecting it here and
+# attaching concrete next-step suggestions (right where the model will
+# read the result) is cheaper than letting it burn another blind turn.
+# ==========================================
+_NO_MATCH_PHRASES = (
+    "no results", "no matches", "no match found", "0 results",
+    "not found", "no such", "nothing found", "no data", "no items",
+)
+
+
+def _looks_like_empty_result(result_text):
+    if result_text is None:
+        return True
+    stripped = result_text.strip()
+    if not stripped:
+        return True
+    if stripped in ("[]", "{}", "null", "none"):
+        return True
+    try:
+        parsed = json.loads(stripped)
+        if isinstance(parsed, (list, dict)) and len(parsed) == 0:
+            return True
+    except (json.JSONDecodeError, TypeError):
+        pass
+    lowered = stripped.lower()
+    return any(phrase in lowered for phrase in _NO_MATCH_PHRASES)
+
+
+def _empty_result_guidance(tool_name):
+    """Tool-specific next steps, since "try something else" means something
+    different for a text search vs. a graph query."""
+    suggestions = {
+        "search_code": (
+            "No matches. Try a shorter or more generic `pattern`, drop `file_pattern` "
+            "if one was set, or try `search_graph` instead — it may find the same "
+            "code by structure rather than by text."
+        ),
+        "search_graph": (
+            "No matches. Try a shorter or more generic `query`, drop or change the "
+            "`label` filter, or try `search_code` instead — it may find the same "
+            "code by text rather than by structure."
+        ),
+        "get_code_snippet": (
+            "No snippet found for that `qualified_name`. It may be stale or slightly "
+            "wrong — re-run `search_code`/`search_graph` to get a fresh, exact "
+            "`qualified_name` instead of reusing or guessing one."
+        ),
+        "query_graph": (
+            "No results. Simplify the cypher query, verify node/relationship labels "
+            "exist in this project via `search_graph`, or double-check the project name."
+        ),
+        "get_architecture": (
+            "No architecture data returned. Double-check the project name against the "
+            "ALREADY KNOWN list or `list_projects`."
+        ),
+    }
+    return suggestions.get(
+        tool_name,
+        "No results. Double-check the arguments (especially the project name) and try "
+        "a different approach rather than repeating the same call.",
+    )
+
+
+# ==========================================
+# Phase 5b: repeated-call / stuck-loop detection
+# The existing within-batch dedup only catches the same call appearing
+# twice in one <tools> array. This catches the model re-issuing the exact
+# same (tool, args) call across separate turns — a sign it's stuck rather
+# than making progress — and forces a change of approach instead of
+# silently letting it burn turns/rate-limit budget on repeats.
+# ==========================================
+_STUCK_LOOP_THRESHOLD = 3
+
+
+def _call_signature(tool_name, args_dict):
+    return f"{tool_name}:{json.dumps(args_dict, sort_keys=True)}"
+
+
+# ==========================================
+# MAIN INTERACTIVE LOOP
+# ==========================================
+def start_interactive_chat(access_token, chosen_model):
+    print(f"\n=== Chat Session Started (Model: {chosen_model}) ===")
+    print("Type 'quit' or 'exit' to stop.\n")
+
+    # Phase 1: the permanent, untouched record of every message. Compaction
+    # (see context.compact_if_needed) only ever shortens what gets SENT to
+    # the model each turn — it never modifies or drops anything from here.
+    full_transcript = []
+    # What actually gets sent — may be replaced with a compacted copy.
+    working_messages = []
+
+    while True:
+        try:
+            user_input = input("\n\U0001f9d1 You: ")
+            if user_input.strip().lower() in ['quit', 'exit']:
+                print("Goodbye!")
+                break
+            if not user_input.strip():
+                continue
+
+            user_msg = {"role": "user", "content": user_input}
+            full_transcript.append(user_msg)
+            working_messages.append(user_msg)
+
+            is_new_investigation = True   # only this question's first call plans deeply
+            verify_retry_used = False     # allow exactly one nudge if <verify> fails
+
+            # Phase 2: id -> {"tool": ..., "args": ..., "result": ...} for
+            # every tool call executed so far in this question, so <verify>
+            # claims can be checked against real evidence.
+            tool_result_map = {}
+            next_tool_id = 1
+
+            # Phase 5b: (tool, args) signature -> how many times it's been
+            # called so far this question, across turns (not just within
+            # one batch, which is already deduped above).
+            repeated_call_counts = {}
+
+            # THE ReAct LOOP (Synthetic User Message Architecture)
+            while True:
+                # Phase 1: compact the working list if it's grown past budget.
+                # `full_transcript` is untouched no matter what happens here.
+                working_messages = context.compact_if_needed(working_messages)
+
+                assistant_reply = chat_with_codex(access_token, chosen_model, working_messages, is_new_investigation)
+                if not assistant_reply:
+                    break
+
+                assistant_msg = {"role": "assistant", "content": assistant_reply}
+                full_transcript.append(assistant_msg)
+                working_messages.append(assistant_msg)
+                is_new_investigation = False
+
+                # Extract every <tools> block in the reply (usually one, but merge
+                # instead of silently dropping extras if the model ever emits more
+                # than one in a single turn).
+                tools_blocks = re.findall(r'<tools>\s*(.*?)\s*</tools>', assistant_reply, re.DOTALL)
+
+                if tools_blocks:
+                    try:
+                        tools_array = []
+                        for block in tools_blocks:
+                            tools_array.extend(json.loads(block))
+                        if len(tools_blocks) > 1:
+                            print(f"\n[i] Reply had {len(tools_blocks)} <tools> blocks — merged into one batch.")
+
+                        # De-duplicate identical (tool, args) pairs within this batch —
+                        # no reason to pay for the same call twice in one turn.
+                        seen_calls = set()
+                        deduped = []
+                        for tool in tools_array:
+                            sig = (tool.get("_mcp_tool"), json.dumps(tool.get("_mcp_args", {}), sort_keys=True))
+                            if sig in seen_calls:
+                                continue
+                            seen_calls.add(sig)
+                            deduped.append(tool)
+                        tools_array = deduped
+
+                        # Use XML tags to define boundaries exactly like VSCode
+                        aggregated_results = ["<tool_results>"]
+                        # Phase 5b: signatures that just crossed a repeat threshold
+                        # in this batch, to warn about after results are assembled.
+                        stuck_signatures = []
+
+                        # Execute all requested tools in parallel/sequentially
+                        for tool in tools_array:
+                            t_name = tool.get("_mcp_tool")
+                            t_args = tool.get("_mcp_args", {})
+
+                            # Phase 5b: count this exact call across the whole
+                            # question, not just this batch.
+                            sig = _call_signature(t_name, t_args)
+                            repeated_call_counts[sig] = repeated_call_counts.get(sig, 0) + 1
+                            call_count = repeated_call_counts[sig]
+                            if call_count >= _STUCK_LOOP_THRESHOLD and call_count % _STUCK_LOOP_THRESHOLD == 0:
+                                stuck_signatures.append((t_name, t_args, call_count))
+
+                            is_valid, err = validate_tool_call(t_name, t_args)
+                            if not is_valid:
+                                t_result = f"VALIDATION ERROR (tool NOT executed): {err}"
+                            else:
+                                t_result = execute_mcp_tool(t_name, t_args)
+                                if t_name == "list_projects" and "Error" not in t_result:
+                                    note_known_projects(t_result)
+
+                                # Phase 5a: an empty/no-match result is easy to skim
+                                # past — attach concrete next-step guidance right
+                                # where the model will read it.
+                                if "Error" not in t_result and _looks_like_empty_result(t_result):
+                                    t_result = f"{t_result}\n\n[GUIDANCE: {_empty_result_guidance(t_name)}]"
+
+                            # Phase 2: assign this call a short id and remember it so
+                            # <verify> claims can be checked against real evidence.
+                            tool_id = f"t-{next_tool_id}"
+                            next_tool_id += 1
+                            tool_result_map[tool_id] = {
+                                "tool": t_name,
+                                "args": t_args,
+                                "result": t_result,
+                            }
+
+                            # Wrap individual results to prevent context confusion
+                            aggregated_results.append(f'  <result id="{tool_id}" tool="{t_name}">\n{t_result}\n  </result>')
+
+                        aggregated_results.append("</tool_results>")
+
+                        # Feed the synthetic user message back into the loop silently
+                        synthetic_user_message = "\n".join(aggregated_results)
+                        synth_msg = {"role": "user", "content": synthetic_user_message}
+                        full_transcript.append(synth_msg)
+                        working_messages.append(synth_msg)
+                        verify_retry_used = False
+
+                        # Phase 5b: the same exact call repeating across turns means
+                        # the model is stuck, not making progress — force a change
+                        # of approach instead of letting it keep spending turns/RPM.
+                        if stuck_signatures:
+                            warning_lines = [
+                                f'- `{t_name}` with args {json.dumps(t_args)} has now been called '
+                                f'{count} times this question with no new information gained. Stop '
+                                'repeating this exact call.'
+                                for t_name, t_args, count in stuck_signatures
+                            ]
+                            print(f"\n[i] Stuck-loop guard triggered for {len(stuck_signatures)} repeated call(s).")
+                            stuck_msg = {
+                                "role": "user",
+                                "content": (
+                                    "<system_warning>\n" + "\n".join(warning_lines) + "\n"
+                                    "Change your approach: try different search terms, a different tool "
+                                    "(search_code vs search_graph), re-check the project name, or "
+                                    "conclude from what you already have instead of repeating this call.\n"
+                                    "</system_warning>"
+                                )
+                            }
+                            full_transcript.append(stuck_msg)
+                            working_messages.append(stuck_msg)
+                    except json.JSONDecodeError:
+                        print("\n[!] AI outputted malformed JSON in <tools>. Retrying...")
+                        malformed_msg = {
+                            "role": "user",
+                            "content": "<system_error>The JSON array inside <tools> was malformed. Please fix the JSON syntax and try again.</system_error>"
+                        }
+                        full_transcript.append(malformed_msg)
+                        working_messages.append(malformed_msg)
+                else:
+                    # No <tools> tag — the model believes it's done investigating.
+                    # Phase 2: check the <verify> block for real evidence, not just presence.
+                    ok, detail = check_verify_block(assistant_reply, tool_result_map)
+                    if not ok and not verify_retry_used:
+                        verify_retry_used = True
+                        print(f"\n[i] Verify check failed ({detail}) — requesting a corrected one...")
+                        retry_msg = {
+                            "role": "user",
+                            "content": (
+                                "<system_check>Your <verify> block did not pass evidence checking: "
+                                f"{detail} Every claim must end with the id(s) (e.g. t-3) of the tool "
+                                "result(s) that support it, copied exactly from the <result id=\"...\"> "
+                                "tags you were given earlier. Fix or drop the unsupported claim(s), then "
+                                "give your final answer again.</system_check>"
+                            )
+                        }
+                        full_transcript.append(retry_msg)
+                        working_messages.append(retry_msg)
+                        continue
+                    break
+
+        except KeyboardInterrupt:
+            print("\nGoodbye!")
+            break

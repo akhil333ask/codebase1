@@ -1,0 +1,64 @@
+Phase 13 — three fixes to agent.py / mcp_tools.py, no unrelated changes.
+
+1. FIX: query_graph results getting mislabeled "weak" due to Cypher syntax
+   leaking into the term-overlap check.
+
+   In mcp_tools.py (or wherever _significant_terms / _STOPWORDS live —
+   confirm the actual file, this may have moved), _looks_like_weak_result
+   extracts "significant terms" from a query_graph call's `query` field to
+   check overlap against the result text. For query_graph specifically,
+   that field is a literal Cypher query, e.g.:
+     MATCH (caller)-[:CALLS]->(callee) WHERE callee.qualified_name = 'x'
+     RETURN caller.qualified_name LIMIT 20
+   _STOPWORDS doesn't include Cypher keywords (match, where, return, limit,
+   distinct, as, order, by), so they get counted as "significant terms" —
+   but they never appear in a result made of actual node/qualified names,
+   which artificially deflates the overlap ratio and can get a genuinely
+   correct traversal result flagged "weak/inconclusive."
+
+   Fix: add a Cypher-keyword stopword set (or extend _STOPWORDS) so these
+   don't count as significant terms when scoring query_graph results
+   specifically. Don't change the term-extraction behavior for
+   search_code/search_graph — this is a query_graph-only leak.
+
+2. FIX: stuck-loop guard false-positives on legitimate sequential file
+   reading.
+
+   _call_signature's read_file_chunk range-union logic (Phase 12) is
+   meant to catch a model rereading the same region without progress, but
+   it currently treats ANY pairwise-overlapping window as evidence of
+   being stuck — including the normal case of paginating forward through
+   a large file with intentional overlap (which the system instructions
+   themselves recommend: ~100-200 lines of surrounding context). Three
+   sequential windows like 1-200, 150-350, 300-500 all pairwise-overlap
+   and collapse into one growing signature, so _STUCK_LOOP_THRESHOLD=3 can
+   fire on a model making real linear progress through a file, not one
+   that's stuck.
+
+   Fix: only count a call toward the stuck-loop threshold when the new
+   range is ALREADY fully covered by the accumulated union (i.e. no new
+   ground gained) — not merely overlapping it. A call that extends the
+   union's start or end should reset that group's count rather than
+   incrementing it, since it represents forward progress. Keep the
+   existing byte-identical-args signature path for every other tool
+   unchanged.
+
+3. NO CHANGE, close out the flagged item from Phase 11: don't add
+   eviction or a "this result has since been summarized" rejection for
+   compacted-away tool ids. check_verify_block reads from
+   tool_result_map, not from the (possibly-compacted) working_messages —
+   compact_if_needed only ever shortens what's SENT to the model, it
+   never touches tool_result_map, so the original result text a citation
+   is checked against is always still there and still true, even after
+   that message has been folded into a compacted summary. Evicting it
+   would swap a real false-negative bug for a fake one — rejecting valid
+   citations because the *display* got compacted, not because the
+   evidence stopped existing. Just add a one-line comment at the
+   compaction/tool_result_map boundary noting they're intentionally
+   decoupled and why, so this doesn't get re-flagged as ambiguous next
+   time someone reads the code.
+
+Verify 1 and 2 the same way you verified Phase 11: import agent.py /
+mcp_tools.py directly and reproduce the failure mode under old code, then
+confirm it's fixed. Report back which files changed and confirm nothing
+outside agent.py/mcp_tools.py was touched.

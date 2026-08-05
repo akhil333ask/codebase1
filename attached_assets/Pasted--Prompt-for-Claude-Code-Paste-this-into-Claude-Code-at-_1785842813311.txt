@@ -1,0 +1,104 @@
+# Prompt for Claude Code
+
+Paste this into Claude Code at the root of the `codebase_agent` project (where
+`agent.py`, `mcp_tools.py`, `config.py`, `context.py`, `auth.py`, `main.py` live).
+
+---
+
+I have a Python ReAct-style codebase-QA agent (`agent.py`, `mcp_tools.py`,
+`config.py`, `context.py`, `auth.py`, `main.py`). It has a token-aware context
+compactor, an evidence-checked `<verify>` grounding system (Phase 2), and a
+goal-coverage check that cross-references the model's own stated sub-goals
+against its final `<verify>` block (Phase 8).
+
+**Observed failure:** on a 3-part question, it correctly answered parts 1 and
+3 but failed part 2 ("find the method that performs the delayed/lazy fetch of
+raw pixel bytes for rendering") because:
+- its `grep_search` regex attempts only targeted words like `pixel`, `fetch`,
+  `lazy`, `deferred`, `bulk data` — the real method (`getUncacheImage`,
+  calling `buildSegmentedImageInputImageStream`) contains none of them, so
+  every search came back empty or off-target;
+- the system prompt discourages reading a whole file and only tells the model
+  to read ~100-200 lines around a match, so once search missed, the model
+  never found the right region of the file on its own;
+- when the model gave up and wrote a `<verify>` claim like "the delayed raw
+  pixel-byte fetch method could not be resolved from the inspected snippets,"
+  `find_uncovered_goals` (Phase 8) marked that goal as **covered**, because
+  it only checks lexical term overlap between the goal and the claim text —
+  it has no notion of whether the claim is actually a resolution or an
+  admission of failure. A fluent "I give up" that reuses the goal's own
+  wording passes the same check a real answer would.
+- the retry budget (`verify_retry_used`, `goal_coverage_retry_used` in
+  `agent.py`'s `start_interactive_chat`) allows exactly one nudge each, so
+  the harness accepted the give-up answer as final on the very next turn.
+
+Please make these changes:
+
+## 1. New native tool: `outline_file` (in `mcp_tools.py`)
+
+Add it alongside `grep_search` / `read_file_chunk` / `find_symbol_usages`,
+following the exact same conventions (native tool, bypasses `MCP_EXE_PATH`,
+resolves via `_resolve_project_root`, cacheable).
+
+- Args: `{"project": "...", "file_path": "..."}`
+- Behavior: regex-scan the file for method/function/class/interface
+  signatures (reuse/generalize the `definition_patterns` logic already in
+  `_classify_symbol_occurrence`) and return every signature found, one per
+  line, prefixed with its line number — e.g.
+  `810: private PlanarImage getUncacheImage(MediaElement media, int frame)`.
+- Wire it into `TOOL_SCHEMAS`, `TOOL_JSON_SCHEMAS`, `_NATIVE_TOOLS`,
+  `CACHEABLE_TOOLS`, and the dispatch branch in `execute_mcp_tool`, mirroring
+  how `read_file_chunk` is wired in each of those places.
+- Goal: let the model see every candidate method in a file in one cheap
+  call instead of guessing keywords or reading 400-line chunks hoping to
+  land on the right region.
+
+## 2. System-prompt guidance (`agent.py`, `build_system_instructions`)
+
+Add a new numbered rule (after the existing fallback rule 10/11):
+
+- If `grep_search`/`search_code`/`search_graph` all come up empty or weak for
+  a concept **inside a file you already know is relevant** (e.g. because an
+  earlier finding came from that same file), call `outline_file` on it
+  before trying more keyword variations — the target method's name may not
+  share any vocabulary with the concept you're looking for.
+- Add explicit anti-guidance against "keyword salad" regexes: a
+  `regex_pattern` should target plausible identifier fragments or real
+  API/library names (e.g. class names visible in imports), never multi-word
+  English phrases like `"raw pixel"` or `"bulk data"` that won't appear
+  verbatim in source code.
+
+## 3. Fix goal-coverage to detect give-ups (`agent.py`, `find_uncovered_goals`, Phase 8)
+
+Add a small set of hedge/negation phrases (e.g. `"could not be resolved"`,
+`"not found"`, `"unresolved"`, `"unable to locate"`,
+`"not conclusively identified"`, `"not identified"`, `"no definitive"`). If
+the claim text addressing a given goal contains one of these phrases, do
+**not** count that goal as covered — keep it in `missing_goals` even though
+its keyword-overlap ratio would otherwise pass. Grounding (Phase 2, real
+tool-result ids) is separate and should still be required either way.
+
+## 4. Loosen the retry budget (`agent.py`, `start_interactive_chat`)
+
+Replace the single-use `verify_retry_used` / `goal_coverage_retry_used`
+booleans with small counters — allow up to 3 goal-coverage nudges instead of
+exactly 1. Make the 2nd+ nudge message explicitly point at the new
+`outline_file` fallback from item 2, so the model doesn't just repeat the
+same failed keyword search a second time with no new strategy.
+
+## 5. Flag, don't silently change, the model config
+
+`auth.py` currently enforces `gpt-5.4-mini` via the ChatGPT backend
+(`chatgpt.com/backend-api/codex/responses`), not the Anthropic API. Leave
+this behavior as-is — don't change which backend or model is called — but
+add a one-line comment in `config.py` near `MAX_RPM` noting that a
+non-mini/larger model is likely to sustain multi-step investigative strategy
+shifts (like switching from keyword search to file-outline reading) better
+than a mini model, since that's a plausible contributing factor to search
+give-ups.
+
+---
+
+Keep everything else identical — this is a targeted patch, not a rewrite.
+When done, show a diff-style summary of every change (file, function,
+what changed and why) so I can review before running it.
